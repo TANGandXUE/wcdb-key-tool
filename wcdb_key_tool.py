@@ -82,10 +82,36 @@ def _load_openssl() -> ctypes.CDLL:
 _ssl: ctypes.CDLL | None = None
 
 
+def _configure_evp_prototypes(ssl: ctypes.CDLL) -> None:
+    """Declare restype/argtypes for the EVP functions.
+
+    Without this, ctypes assumes every return value and argument is a 32-bit C int, so the
+    64-bit pointers returned by EVP_CIPHER_CTX_new()/EVP_aes_256_cbc() are truncated — the
+    next call dereferences a garbage pointer and the process SEGFAULTS. Declaring the
+    prototypes keeps the pointers 64-bit wide.
+    """
+    c = ctypes
+    ssl.EVP_CIPHER_CTX_new.restype = c.c_void_p
+    ssl.EVP_CIPHER_CTX_new.argtypes = []
+    ssl.EVP_aes_256_cbc.restype = c.c_void_p
+    ssl.EVP_aes_256_cbc.argtypes = []
+    ssl.EVP_DecryptInit_ex.restype = c.c_int
+    ssl.EVP_DecryptInit_ex.argtypes = [c.c_void_p, c.c_void_p, c.c_void_p, c.c_void_p, c.c_void_p]
+    ssl.EVP_CIPHER_CTX_set_padding.restype = c.c_int
+    ssl.EVP_CIPHER_CTX_set_padding.argtypes = [c.c_void_p, c.c_int]
+    ssl.EVP_DecryptUpdate.restype = c.c_int
+    ssl.EVP_DecryptUpdate.argtypes = [c.c_void_p, c.c_void_p, c.POINTER(c.c_int), c.c_void_p, c.c_int]
+    ssl.EVP_DecryptFinal_ex.restype = c.c_int
+    ssl.EVP_DecryptFinal_ex.argtypes = [c.c_void_p, c.c_void_p, c.POINTER(c.c_int)]
+    ssl.EVP_CIPHER_CTX_free.restype = None
+    ssl.EVP_CIPHER_CTX_free.argtypes = [c.c_void_p]
+
+
 def _get_ssl() -> ctypes.CDLL:
     global _ssl
     if _ssl is None:
         _ssl = _load_openssl()
+        _configure_evp_prototypes(_ssl)
     return _ssl
 
 
@@ -320,19 +346,22 @@ def find_runtime_base(pid: int, binary_path: str | pathlib.Path) -> int:
     except OSError as exc:
         raise RuntimeError(f"无法读取 /proc/{pid}/maps: {exc}") from exc
 
+    # PIE image base = the binary's LOWEST mapping (the one at file offset 0), NOT the
+    # r-xp/.text segment start. The .text segment is mapped at base + several MB, so using
+    # its start as the base makes `base + hook_offset` land in the wrong code and the
+    # breakpoint never fires (tool reports "断点未触发"). Prefer the file-offset-0 mapping;
+    # fall back to the lowest-address mapping for this binary.
+    base = None
     for line in maps_text.splitlines():
         parts = line.split()
-        if len(parts) < 6:
+        if len(parts) < 6 or not parts[5].endswith("/" + binary_name):
             continue
-        if not parts[5].endswith("/" + binary_name):
-            continue
-        if "r" in parts[1] and "x" in parts[1]:
-            return int(parts[0].split("-")[0], 16)
-
-    for line in maps_text.splitlines():
-        parts = line.split()
-        if len(parts) >= 6 and parts[5].endswith("/" + binary_name):
-            return int(parts[0].split("-")[0], 16)
+        start = int(parts[0].split("-")[0], 16)
+        if parts[2] == "00000000":
+            return start
+        base = start if base is None else min(base, start)
+    if base is not None:
+        return base
 
     raise RuntimeError(f"未找到 {binary_name} 的内存映射基址 (PID={pid})")
 
