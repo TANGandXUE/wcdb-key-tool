@@ -320,6 +320,19 @@ def find_runtime_base(pid: int, binary_path: str | pathlib.Path) -> int:
     except OSError as exc:
         raise RuntimeError(f"无法读取 /proc/{pid}/maps: {exc}") from exc
 
+    # 真正的加载基址是 file offset == 0 的那个映射（PT_LOAD 的第一段）。
+    # 不能取第一个可执行段：PIE 二进制的 r-xp 段通常带非零 offset，
+    # 用它当基址会把断点算到未映射的地址上（gdb: Cannot insert breakpoint）。
+    for line in maps_text.splitlines():
+        parts = line.split()
+        if len(parts) < 6:
+            continue
+        if not parts[5].endswith("/" + binary_name):
+            continue
+        if parts[2] == "00000000":
+            return int(parts[0].split("-")[0], 16)
+
+    # 兜底：保留旧行为。
     for line in maps_text.splitlines():
         parts = line.split()
         if len(parts) < 6:
